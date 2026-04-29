@@ -4,10 +4,10 @@ __pycache__/
 *$py.class
 *.so
 .Python
-venv/
+venv311/
 ENV/
 env/
-.venv
+.venv311
 
 # IDE
 .vscode/
