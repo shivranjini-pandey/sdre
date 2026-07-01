@@ -215,4 +215,81 @@ Respond with ONLY the intent word, nothing else."""),
 
         return {**state, "retrieved_chunks": chunks, "reranked_chunks": chunks}
 
-    
+    async def _analytical_retrieve_node(self, state: AgentState) -> AgentState:
+        """
+        Chain-of-thought retrieval for analytical queries.
+        Decomposes query into sub-questions and retrieves for each.
+        """
+        from app.retriever import get_retriever
+        from app.reranker import get_reranker
+
+        # Step 1: Decompose query into sub-questions
+        decompose_prompt = f"""Break this query into 2-3 specific sub-questions that together would answer it.
+Return only the sub-questions, one per line, no numbering.
+
+Query: {state["query"]}"""
+
+        response = await self.llm.ainvoke([HumanMessage(content=decompose_prompt)])
+        sub_questions = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+
+        logger.info("Query decomposed", sub_questions=sub_questions)
+
+        # Step 2: Retrieve for each sub-question
+        retriever = get_retriever(self._db)
+        all_chunks = []
+        seen_ids = set()
+
+        for sub_q in sub_questions:
+            chunks = await retriever.retrieve(sub_q, top_k=10)
+            for chunk in chunks:
+                if chunk["chunk_id"] not in seen_ids:
+                    all_chunks.append(chunk)
+                    seen_ids.add(chunk["chunk_id"])
+
+        # Step 3: Rerank combined results against original query
+        reranker = get_reranker()
+        reranked = reranker.rerank(state["query"], all_chunks, top_k=settings.FINAL_TOP_K)
+
+        return {**state, "retrieved_chunks": all_chunks, "reranked_chunks": reranked}
+
+    async def _generate_node(self, state: AgentState) -> AgentState:
+        """Generate answer from retrieved chunks."""
+        from app.llm import get_llm_manager
+
+        chunks = state.get("reranked_chunks") or state.get("retrieved_chunks") or []
+
+        if not chunks:
+            return {**state, "answer": "No relevant documents found for your query."}
+
+        context_texts = [c["text"] for c in chunks]
+        intent = state.get("intent", QueryIntent.UNKNOWN)
+
+        # Tailor system prompt by intent
+        intent_instructions = {
+            QueryIntent.FACTUAL: "Answer the question directly with the specific fact or detail from the documents.",
+            QueryIntent.COMPARATIVE: "Compare the items mentioned, noting similarities and differences found in the documents.",
+            QueryIntent.SUMMARIZE: "Provide a clear, structured summary of the main points in the documents.",
+            QueryIntent.ANALYTICAL: "Analyze the content thoughtfully, identifying key implications, risks, or patterns.",
+            QueryIntent.UNKNOWN: "Answer the question based on the provided documents.",
+        }
+
+        llm = get_llm_manager(settings.GROQ_API_KEY)
+        answer, cost, _, _ = llm.generate(
+            state["query"],
+            context_texts,
+            system_instruction=intent_instructions.get(intent, ""),
+        )
+
+        return {**state, "answer": answer, "cost_usd": state["cost_usd"] + cost}
+
+
+# Singleton
+_router: Optional[QueryRouter] = None
+
+
+def get_router() -> QueryRouter:
+    """Get or create query router (singleton)."""
+    global _router
+    if _router is None:
+        _router = QueryRouter()
+    return _router
