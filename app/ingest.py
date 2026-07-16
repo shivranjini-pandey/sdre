@@ -109,7 +109,7 @@ class DocumentIngester:
                 embedding=embedding.tolist(),  # Convert numpy to list
             )
             self.db.add(chunk)
-            
+            self.db.flush()
             # Also index in BM25
             self.bm25_index.index_document(chunk.id, chunk_text)
         
